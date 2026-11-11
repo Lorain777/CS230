@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dataset, preprocessing cache and training outputs
+data/
+runs/
