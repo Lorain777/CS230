@@ -222,3 +222,5 @@ __marimo__/
 # Dataset, preprocessing cache and training outputs
 data/
 runs/
+.secrets/
+.venv/
