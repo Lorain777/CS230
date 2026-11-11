@@ -1,20 +1,25 @@
 """Train and test U-Net baselines with patient-level cross-validation.
 
-    python -m fibroid.train --slices 1 --model standard
-    python -m fibroid.train --slices 1 --model dropblock
-    python -m fibroid.train --slices 1 --model skip_hardship
+    python -m fibroid.train --slices 1 --model standard --wandb
+    python -m fibroid.train --slices 1 --model dropout --wandb
+    python -m fibroid.train --slices 1 --model dropblock --wandb
+    python -m fibroid.train --slices 1 --model skip_hardship --wandb
 
-    python -m fibroid.train --slices 5 --model standard
+    python -m fibroid.train --slices 5 --model standard --wandb
     ...
 
-Each fold trains on the other folds (minus a validation subset used for early
-stopping), then writes test predictions' metrics to <out>/fold<k>/test.json.
+    Each fold trains on the other folds (minus a validation subset used for early
+    stopping), then writes test predictions' metrics to <out>/fold<k>/test.json.
 Finished folds are skipped, so an interrupted run can simply be restarted.
+
+Weights & Biases logs to CoreWeave Forge by default
+(https://forge.coreweave.com/wandb). Override with --wandb-base-url if needed.
 """
 
 import argparse
 import csv
 import json
+import os
 import time
 from pathlib import Path
 
@@ -27,6 +32,9 @@ from .losses import DiceBCELoss
 from .metrics import THRESHOLDS, dice_score, false_positive_counts, lesion_scores
 from .model import VARIANTS, UNet
 
+# CoreWeave Forge multi-tenant W&B API. UI lives at https://forge.coreweave.com/wandb
+FORGE_WANDB_BASE_URL = "https://api.forge.coreweave.com"
+
 
 def pick_device():
     if torch.cuda.is_available():
@@ -36,18 +44,31 @@ def pick_device():
     return torch.device("cpu")
 
 
+def configure_wandb(args):
+    """Point the W&B SDK at CoreWeave Forge (or a custom host)."""
+    if args.wandb_base_url:
+        os.environ["WANDB_BASE_URL"] = args.wandb_base_url
+    else:
+        os.environ.setdefault("WANDB_BASE_URL", FORGE_WANDB_BASE_URL)
+    if args.wandb_entity:
+        os.environ.setdefault("WANDB_ENTITY", args.wandb_entity)
+    os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
+
+
 def maybe_wandb(args, fold):
     """Start a W&B run when --wandb is set; returns the run or None."""
     if not args.wandb:
         return None
     import wandb
 
-    return wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=f"{args.model}_s{args.slices}_fold{fold}",
-        group=f"{args.model}_s{args.slices}",
-        config={
+    configure_wandb(args)
+    init_kwargs = {
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "name": f"{args.model}_s{args.slices}_fold{fold}",
+        "group": f"{args.model}_s{args.slices}",
+        "job_type": "train",
+        "config": {
             "model": args.model,
             "slices": args.slices,
             "fold": fold,
@@ -58,9 +79,17 @@ def maybe_wandb(args, fold):
             "dropblock_keep_prob": args.dropblock_keep_prob,
             "dropblock_size": args.dropblock_size,
             "skip_drop_prob": args.skip_drop_prob,
+            "dropout_p": args.dropout_p,
+            "wandb_base_url": os.environ.get("WANDB_BASE_URL"),
         },
-        reinit=True,
-    )
+        "reinit": True,
+    }
+    # Prefer Settings when the installed wandb build supports base_url.
+    try:
+        init_kwargs["settings"] = wandb.Settings(base_url=os.environ.get("WANDB_BASE_URL"))
+    except TypeError:
+        pass
+    return wandb.init(**init_kwargs)
 
 
 def scheduled_keep_prob(epoch, epochs, final_keep_prob):
@@ -91,6 +120,23 @@ def mean_dice(model, cases, n_slices, device):
     return float(np.mean(scores))
 
 
+@torch.no_grad()
+def mean_val_loss(model, cases, n_slices, device, criterion, batch_size=32):
+    """Average Dice+BCE loss over validation patients (slice minibatches)."""
+    model.eval()
+    total, n = 0.0, 0
+    center = n_slices // 2
+    for case in cases:
+        context = context_indices(case["image"].shape[0], n_slices)
+        target_vol = case["myoma"].float()
+        for rows in context.split(batch_size):
+            images = case["image"][rows].float().to(device)
+            targets = target_vol[rows[:, center]].unsqueeze(1).to(device)
+            total += criterion(model(images), targets).item() * rows.shape[0]
+            n += rows.shape[0]
+    return total / max(n, 1)
+
+
 def test_metrics(model, cases, n_slices, device):
     patients, lesions = [], []
     for case in cases:
@@ -115,6 +161,7 @@ def build_model(args):
         dropblock_keep_prob=args.dropblock_keep_prob,
         dropblock_size=args.dropblock_size,
         skip_drop_prob=args.skip_drop_prob,
+        dropout_p=args.dropout_p,
     )
 
 
@@ -145,10 +192,11 @@ def train_fold(args, fold, meta, device):
     run = maybe_wandb(args, fold)
 
     best_dice, best_epoch = -1.0, 0
+    train_started = time.time()
     try:
         with open(out_dir / "log.csv", "w", newline="") as log_file:
             log = csv.writer(log_file)
-            log.writerow(["epoch", "train_loss", "val_dice", "keep_prob", "seconds"])
+            log.writerow(["epoch", "train_loss", "val_loss", "val_dice", "keep_prob", "seconds"])
             for epoch in range(1, args.epochs + 1):
                 start = time.time()
                 keep_prob = scheduled_keep_prob(epoch, args.epochs, args.dropblock_keep_prob)
@@ -165,24 +213,40 @@ def train_fold(args, fold, meta, device):
                     optimizer.step()
                     running += loss.item()
                 train_loss = running / len(loader)
+                val_loss = mean_val_loss(model, val_cases, args.slices, device, criterion)
                 val_dice = mean_dice(model, val_cases, args.slices, device)
                 seconds = time.time() - start
-                log.writerow([epoch, f"{train_loss:.4f}", f"{val_dice:.4f}", f"{keep_prob:.4f}", f"{seconds:.0f}"])
+                elapsed = time.time() - train_started
+                log.writerow(
+                    [
+                        epoch,
+                        f"{train_loss:.4f}",
+                        f"{val_loss:.4f}",
+                        f"{val_dice:.4f}",
+                        f"{keep_prob:.4f}",
+                        f"{seconds:.0f}",
+                    ]
+                )
                 log_file.flush()
                 print(
-                    f"fold {fold} epoch {epoch:3d}  loss {train_loss:.4f}  val dice {val_dice:.4f}  "
+                    f"fold {fold} epoch {epoch:3d}  train/loss {train_loss:.4f}  "
+                    f"val/loss {val_loss:.4f}  val/dice {val_dice:.4f}  "
                     f"keep {keep_prob:.3f}  {seconds:.0f}s",
                     flush=True,
                 )
                 if run is not None:
+                    # Forge charts: epoch (x), time/*, train/*, val/*
                     run.log(
                         {
                             "epoch": epoch,
                             "train/loss": train_loss,
+                            "val/loss": val_loss,
                             "val/dice": val_dice,
                             "train/keep_prob": keep_prob,
                             "time/epoch_seconds": seconds,
-                        }
+                            "time/elapsed_seconds": elapsed,
+                        },
+                        step=epoch,
                     )
 
                 if val_dice > best_dice:
@@ -192,6 +256,7 @@ def train_fold(args, fold, meta, device):
                             "model": model.state_dict(),
                             "epoch": epoch,
                             "val_dice": val_dice,
+                            "val_loss": val_loss,
                             "variant": args.model,
                         },
                         out_dir / "best.pt",
@@ -211,6 +276,7 @@ def train_fold(args, fold, meta, device):
             dropblock_keep_prob=args.dropblock_keep_prob,
             dropblock_size=args.dropblock_size,
             skip_drop_prob=args.skip_drop_prob,
+            dropout_p=args.dropout_p,
             best_epoch=best_epoch,
             best_val_dice=best_dice,
         )
@@ -246,17 +312,28 @@ def main():
     parser.add_argument("--dropblock-keep-prob", type=float, default=0.9, help="final DropBlock keep probability")
     parser.add_argument("--dropblock-size", type=int, default=7, help="DropBlock square size")
     parser.add_argument("--skip-drop-prob", type=float, default=0.25, help="skip-hardship drop probability per skip")
-    parser.add_argument("--wandb", action="store_true", help="log each fold to Weights & Biases")
+    parser.add_argument("--dropout-p", type=float, default=0.1, help="Dropout2d probability for --model dropout")
+    parser.add_argument("--wandb", action="store_true", help="log each fold to Weights & Biases (CoreWeave Forge)")
     parser.add_argument("--wandb-project", default="umd-fibroid")
     parser.add_argument("--wandb-entity", default=None, help="W&B entity/team (default: your account)")
+    parser.add_argument(
+        "--wandb-base-url",
+        default=FORGE_WANDB_BASE_URL,
+        help="W&B API host (default: CoreWeave Forge)",
+    )
     args = parser.parse_args()
     if args.slices % 2 != 1:
         parser.error("--slices must be odd")
     args.out = args.out or Path(f"runs/{args.model}_s{args.slices}")
+    if args.wandb:
+        configure_wandb(args)
 
     meta = load_meta(args.cache)
     device = pick_device()
-    print(f"device: {device}  model: {args.model}  slices: {args.slices}  out: {args.out}")
+    print(
+        f"device: {device}  model: {args.model}  slices: {args.slices}  out: {args.out}"
+        + (f"  wandb: {os.environ.get('WANDB_BASE_URL')}/{args.wandb_project}" if args.wandb else "")
+    )
     for fold in args.folds if args.folds is not None else range(meta["n_folds"]):
         train_fold(args, fold, meta, device)
 

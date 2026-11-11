@@ -1,8 +1,9 @@
-"""2D U-Net and the DropBlock / random-skip-hardship variants.
+"""2D U-Net and the dropout / DropBlock / random-skip-hardship variants.
 
 Variants
 --------
 standard       Vanilla U-Net.
+dropout        Channel Dropout2d after every convolution (classic dropout baseline).
 dropblock      DropBlock after every convolution (Ghiasi et al., NeurIPS 2018).
 skip_hardship  DropBlock plus, during training only, randomly zeroing whole
                skip connections. The name is not a published method: it means
@@ -13,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-VARIANTS = ("standard", "dropblock", "skip_hardship")
+VARIANTS = ("standard", "dropout", "dropblock", "skip_hardship")
 
 
 class DropBlock2d(nn.Module):
@@ -63,9 +64,21 @@ class DropBlock2d(nn.Module):
         return x * mask * (mask.numel() / (mask.sum() + 1e-6))
 
 
-def conv_block(in_channels, out_channels, dropblock=False, block_size=7, keep_prob=0.9):
-    """Two 3x3 convolutions. With DropBlock the order matches SD/SA-UNet:
-    Conv → DropBlock → BatchNorm → ReLU."""
+def conv_block(
+    in_channels,
+    out_channels,
+    *,
+    dropblock=False,
+    dropout=False,
+    block_size=7,
+    keep_prob=0.9,
+    dropout_p=0.1,
+):
+    """Two 3x3 convolutions.
+
+    DropBlock order matches SD/SA-UNet: Conv → DropBlock → BatchNorm → ReLU.
+    Classic dropout uses: Conv → BatchNorm → ReLU → Dropout2d.
+    """
     layers = []
     for cin, cout in ((in_channels, out_channels), (out_channels, out_channels)):
         layers.append(nn.Conv2d(cin, cout, 3, padding=1, bias=False))
@@ -73,6 +86,8 @@ def conv_block(in_channels, out_channels, dropblock=False, block_size=7, keep_pr
             layers.append(DropBlock2d(block_size, keep_prob))
         layers.append(nn.BatchNorm2d(cout))
         layers.append(nn.ReLU(inplace=True))
+        if dropout:
+            layers.append(nn.Dropout2d(p=dropout_p))
     return nn.Sequential(*layers)
 
 
@@ -90,24 +105,43 @@ class UNet(nn.Module):
         dropblock_keep_prob=0.9,
         dropblock_size=7,
         skip_drop_prob=0.25,
+        dropout_p=0.1,
     ):
         super().__init__()
         if variant not in VARIANTS:
             raise ValueError(f"unknown variant {variant!r}; choose from {VARIANTS}")
         self.variant = variant
         self.skip_drop_prob = float(skip_drop_prob)
-        use_drop = variant in ("dropblock", "skip_hardship")
+        use_dropblock = variant in ("dropblock", "skip_hardship")
+        use_dropout = variant == "dropout"
 
         widths = [in_channels, *channels]
         self.encoders = nn.ModuleList(
-            conv_block(a, b, use_drop, dropblock_size, dropblock_keep_prob)
+            conv_block(
+                a,
+                b,
+                dropblock=use_dropblock,
+                dropout=use_dropout,
+                block_size=dropblock_size,
+                keep_prob=dropblock_keep_prob,
+                dropout_p=dropout_p,
+            )
             for a, b in zip(widths, widths[1:])
         )
         self.pool = nn.MaxPool2d(2)
         pairs = list(zip(channels[:0:-1], channels[-2::-1]))  # (256, 128), (128, 64), (64, 32)
         self.upsamplers = nn.ModuleList(nn.ConvTranspose2d(a, b, 2, stride=2) for a, b in pairs)
         self.decoders = nn.ModuleList(
-            conv_block(2 * b, b, use_drop, dropblock_size, dropblock_keep_prob) for _, b in pairs
+            conv_block(
+                2 * b,
+                b,
+                dropblock=use_dropblock,
+                dropout=use_dropout,
+                block_size=dropblock_size,
+                keep_prob=dropblock_keep_prob,
+                dropout_p=dropout_p,
+            )
+            for _, b in pairs
         )
         self.head = nn.Conv2d(channels[0], out_channels, 1)
 
