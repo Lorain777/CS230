@@ -315,7 +315,11 @@ def main():
     parser.add_argument("--dropout-p", type=float, default=0.1, help="Dropout2d probability for --model dropout")
     parser.add_argument("--wandb", action="store_true", help="log each fold to Weights & Biases (CoreWeave Forge)")
     parser.add_argument("--wandb-project", default="umd-fibroid")
-    parser.add_argument("--wandb-entity", default=None, help="W&B entity/team (default: your account)")
+    parser.add_argument(
+        "--wandb-entity",
+        default="elvayu-stanford-university",
+        help="W&B entity/team on Forge",
+    )
     parser.add_argument(
         "--wandb-base-url",
         default=FORGE_WANDB_BASE_URL,

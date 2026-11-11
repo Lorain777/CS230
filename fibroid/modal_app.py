@@ -31,6 +31,7 @@ MOUNT = Path("/data")
 CACHE = MOUNT / "cache256"
 RUNS = MOUNT / "runs"
 WANDB_PROJECT = "umd-fibroid"
+WANDB_ENTITY = "elvayu-stanford-university"
 # CoreWeave Forge multi-tenant W&B. UI: https://forge.coreweave.com/wandb
 WANDB_BASE_URL = "https://api.forge.coreweave.com"
 
@@ -55,11 +56,13 @@ def _run(cmd: list[str]) -> None:
     subprocess.check_call(cmd)
 
 
-def _configure_forge_wandb(project: str = WANDB_PROJECT) -> None:
+def _configure_forge_wandb(project: str = WANDB_PROJECT, entity: str = WANDB_ENTITY) -> None:
     import os
 
     os.environ.setdefault("WANDB_BASE_URL", WANDB_BASE_URL)
     os.environ.setdefault("WANDB_PROJECT", project)
+    if entity:
+        os.environ.setdefault("WANDB_ENTITY", entity)
 
 
 @app.function(volumes={str(MOUNT): volume}, timeout=60 * 60)
@@ -190,7 +193,7 @@ def validate():
         },
         step=0,
     )
-    report["wandb_url"] = run.get_url()
+    report["wandb_url"] = getattr(run, "url", None)
     run.finish()
     print(report, flush=True)
     return report
@@ -211,7 +214,7 @@ def _train_cmd(
 ) -> tuple[list[str], Path]:
     import os
 
-    _configure_forge_wandb(wandb_project)
+    _configure_forge_wandb(wandb_project, wandb_entity)
     out = RUNS / f"{model}_s{slices}"
     out.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -237,11 +240,11 @@ def _train_cmd(
         "--wandb",
         "--wandb-project",
         wandb_project,
+        "--wandb-entity",
+        wandb_entity or WANDB_ENTITY,
         "--wandb-base-url",
         os.environ["WANDB_BASE_URL"],
     ]
-    if wandb_entity:
-        cmd += ["--wandb-entity", wandb_entity]
     if folds != "all":
         cmd += ["--folds", *[p for p in folds.replace(",", " ").split() if p]]
     if limit_patients:
@@ -266,7 +269,7 @@ def train(
     dropout_p: float = 0.1,
     dropblock_keep_prob: float = 0.9,
     wandb_project: str = WANDB_PROJECT,
-    wandb_entity: str = "",
+    wandb_entity: str = WANDB_ENTITY,
 ):
     """Launch fibroid.train on Modal and sync run artifacts back to the volume."""
     cmd, out = _train_cmd(
@@ -285,7 +288,11 @@ def train(
         _run(cmd)
     finally:
         volume.commit()
-    return {"out": str(out), "wandb": f"https://forge.coreweave.com/wandb/{wandb_project}"}
+    entity = wandb_entity or WANDB_ENTITY
+    return {
+        "out": str(out),
+        "wandb": f"https://forge.coreweave.com/wandb/{entity}/{wandb_project}",
+    }
 
 
 @app.function(
@@ -304,7 +311,7 @@ def baselines(
     dropout_p: float = 0.1,
     dropblock_keep_prob: float = 0.9,
     wandb_project: str = WANDB_PROJECT,
-    wandb_entity: str = "",
+    wandb_entity: str = WANDB_ENTITY,
     limit_patients: int = 0,
 ):
     """Run the standard vs dropout vs DropBlock baselines and log them to Forge."""
@@ -331,9 +338,10 @@ def baselines(
                 results.append({"model": model_name, "slices": n_slices, "out": str(out)})
     finally:
         volume.commit()
+    entity = wandb_entity or WANDB_ENTITY
     return {
         "runs": results,
-        "forge": f"https://forge.coreweave.com/wandb/{wandb_project}",
+        "forge": f"https://forge.coreweave.com/wandb/{entity}/{wandb_project}",
     }
 
 
